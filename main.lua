@@ -1,4 +1,4 @@
--- Anime Re:Finals | V12 WHOLE LOADED MAP SCAN + STRICT PRIORITY | Potassium / Luau
+-- Anime Re:Finals | V12.2 SMOOTH PRIORITY + LOW-LAG RESPAWN (V12 base) | Potassium / Luau
 -- Strict enemy-only local scan + death-aware teleport rotation + optional Tool attack.
 -- No spoofed server remotes, no Windows mouse clicking, no auto dungeon.
 -- Strict scan: no HP-only targeting, followers/players are excluded. Unverified targets are not attacked.
@@ -11,6 +11,7 @@
 -- V10: strict chosen-only queue, priority-preempt and respawn discovery.
 -- V11: fix Unknown difficulty on enemy nametags; parse combined/rich text and GUI BillboardGui Adornee.
 -- V9 hide/show hotkey and V7 rapid teleport rotation are preserved.
+-- V12.2: soft respawn guards; lightweight checks; no full-map idle scan; restores higher priorities.
 -- V12: scans ALL currently replicated Workspace models (not just 325 studs),
 -- tracks newly replicated Model instances, and does not reset queue on distance.
 -- Roblox StreamingEnabled may leave distant mobs UNLOADED on the client.
@@ -30,12 +31,12 @@ local function streamingEnabled()
 end
 
 local WORLD_SCAN_YIELD_EVERY = 300 -- yield while scanning a large map
-local WORLD_REGISTRY_PRUNE_EVERY = 45 -- clean references to despawned models
+local WORLD_REGISTRY_PRUNE_EVERY = 120 -- prune less often to avoid periodic frame spikes
 local TICK = 0.03   -- 33 lightweight target checks/s, no full map scans in the loop
 local TOOL_COOLDOWN = 0.5
 local RESCAN_WHEN_EMPTY = 4 -- only when cached area targets are exhausted
 local DEAD_SPAWN_COOLDOWN = 1.35 -- do not retarget a freshly killed spawn
-local IDLE_TARGET_RETRY = 0.14 -- if nothing is alive, retry the cached list lightly
+local IDLE_TARGET_RETRY = 0.24 -- when no target, avoid polling every 30ms
 local HIT_DISTANCE = 5.5
 -- If the game keeps the visual enemy model for ~2 s after its HP is gone,
 -- optional FAST NEXT can move when a CONFIRMED enemy's displayed HP is <= 1%.
@@ -46,6 +47,14 @@ local FAST_NEXT_HP_PERCENT = 1.0
 local RAPID_DELAYS = {0.45, 0.25, 0.65, 1.00, 0}
 local RAPID_CHECK_INTERVAL = 0.14
 local RAPID_SPAWN_SKIP = 1.20
+-- The game sometimes reuses a model and leaves its HP nameplate stale.
+-- An unchanged HP bar cannot prove a respawn; try non-invasive visibility/HP
+-- checks first, then allow a *fallback recheck* rather than locking forever.
+-- Increase to 9-12 if your map respawns more slowly; decrease to 4-5 if faster.
+local RESPAWN_RETRY_SECONDS = 7.0
+local RESPAWN_PROBE_INTERVAL = 0.55
+local PRIORITY_PREEMPT_INTERVAL = 0.22
+local DISCOVERY_INTERVAL = 1.1
 
 local sharedEnv = _G
 if type(getgenv) == "function" then
@@ -65,6 +74,10 @@ local state = {
     lastMessageTime = 0, lastTarget = nil,
     transitioning = false, pendingRescan = 0, minimized = false,
     spawnCooldown = {}, originalSpawns = setmetatable({}, {__mode = "k"}),
+    spawnGates = {}, spawnKeyCache = setmetatable({}, {__mode = "k"}),
+    retiredModels = setmetatable({}, {__mode = "k"}),
+    slotCache = nil, slotsDirty = true, slotCacheUntil = 0, nextListRefresh = 0,
+    identityCache = setmetatable({}, {__mode = "k"}),
     acquireAfter = 0, rotationIndex = 0, waitingSince = 0,
     quickRescanPending = false,
     fastNearDeath = true,
@@ -153,7 +166,14 @@ local function pruneWorldIndex()
     state.worldModels=fresh
     state.worldModelSet=unique
     state.worldByName=byName
-    state.nextWorldPrune=os.clock()+WORLD_REGISTRY_PRUNE_EVERY
+    -- Expire old gate metadata for models gone for a long time.
+    local now=os.clock()
+    for key,gate in pairs(state.spawnGates) do
+        if now-gate.at>180 and (not gate.model or not gate.model:IsDescendantOf(workspace)) then
+            state.spawnGates[key]=nil
+        end
+    end
+    state.nextWorldPrune=now+WORLD_REGISTRY_PRUNE_EVERY
 end
 -- Fast structural pre-filter only; the full STRICT enemy filter still decides.
 -- A model with Humanoid/HP/root or an explicit enemy tag is a possible NPC.
@@ -539,8 +559,15 @@ end
 -- Priority identity is a stable combination of the actual enemy's name and
 -- the difficulty shown in its enemy billboard. Never merge different tiers.
 local function mobIdentity(model)
+    -- Reading all labels/descendants repeatedly is costly on a large map.
+    -- Unknown tiers are refreshed sooner, because they may load near the mob.
+    local now=os.clock()
+    local cached=state.identityCache[model]
+    if cached and now<cached.untilAt then return cached.key end
     local _,_,_,tier=evidenceFor(model)
-    return model.Name.." ["..(tier or "Unknown").."]"
+    local key=model.Name.." ["..(tier or "Unknown").."]"
+    state.identityCache[model]={key=key,untilAt=now+(tier and 12 or 2)}
+    return key
 end
 local function displaySelected()
     return state.selected or "none"
@@ -576,7 +603,7 @@ local function makeText(class, title, y, h)
     if class == "TextButton" then Instance.new("UICorner",obj).CornerRadius = UDim.new(0,6) end
     return obj
 end
-local header = makeText("TextLabel","RE:FINALS V12 | WORLD SCAN",8,29)
+local header = makeText("TextLabel","RE:FINALS V12.2 | SMOOTH PRIORITY",8,29)
 -- Header controls, separated from drag area so mouse click does not drag the panel.
 header.Size = UDim2.new(1, -135, 0, 29)
 local function topButton(text, rightOffset)
@@ -747,6 +774,7 @@ local function rebuildPriorityRanks()
     local ranks={}
     for i,name in ipairs(state.priorityOrder) do ranks[name]=i end
     state.priorityRanks=ranks
+    state.slotsDirty=true
     -- An editing change takes effect immediately, even while farming.
     state.visited={}
     state.rotationIndex=0
@@ -873,16 +901,22 @@ local function forgetActive()
 end
 
 local function buildSlots()
+    -- Cache the chosen model list; do NOT rebuild it every farming frame.
+    if not state.slotsDirty and state.slotCache and os.clock()<state.slotCacheUntil then
+        return state.slotCache
+    end
     local slots={}
     for _,m in ipairs(state.targets) do
         local key=mobIdentity(m)
         if state.modeAll then
-            -- Strict whitelist: if no chosen type, there are no ALL-mode targets.
             if state.priorityRanks[key] then slots[#slots+1]=m end
         elseif state.selected and key==state.selected then
             slots[#slots+1]=m
         end
     end
+    state.slotCache=slots
+    state.slotCacheUntil=os.clock()+6
+    state.slotsDirty=false
     return slots
 end
 local function refreshList()
@@ -910,6 +944,7 @@ local function refreshList()
         addConnection(b.Activated:Connect(function()
             state.selected = name
             state.modeAll = false
+            state.slotsDirty=true
             state.visited = {}
             state.rotationIndex = 0
             state.acquireAfter = 0
@@ -935,6 +970,14 @@ local function scanHere(automatic, changedMap)
     local center = r.Position
     state.center = center
     state.targets = {}
+    state.slotsDirty=true
+    state.identityCache=setmetatable({}, {__mode="k"})
+    -- Manual F7 intentionally starts a fresh pass; automatic discovery never
+    -- erases the respawn history. This also lets the user recover at any time.
+    if not automatic then
+        state.spawnGates={}
+        state.retiredModels=setmetatable({}, {__mode="k"})
+    end
     state.visited = {}
     state.rotationIndex = 0
     state.acquireAfter = 0
@@ -974,6 +1017,7 @@ local function scanHere(automatic, changedMap)
         return (ra.Position-center).Magnitude < (rb.Position-center).Magnitude
     end)
     state.targets = models
+    state.slotsDirty=true
     -- Remember a monster's first observed spawn point, even if the same
     -- Model later gets reused or its root temporarily disappears.
     for _, mob in ipairs(models) do
@@ -1027,14 +1071,111 @@ end
 -- Store spawn coordinates, not only Model identity: some games recreate a
 -- new Model at exactly the same spawn immediately after a kill.
 local function spawnKey(model)
+    if not model then return nil end
+    local cached=state.spawnKeyCache[model]
+    if cached then return cached end
     local pos = state.originalSpawns[model]
     if not pos then
         local part = rootOf(model)
         pos = part and part.Position
     end
     if not pos then return nil end
-    local function snap(n) return math.floor(n / 7 + 0.5) end
-    return mobIdentity(model):lower()..":"..snap(pos.X)..":"..snap(pos.Y)..":"..snap(pos.Z)
+    -- Tighter than the old 7-stud bucket to avoid merging two adjacent mobs.
+    local function snap(n) return math.floor(n / 3 + 0.5) end
+    local key=mobIdentity(model):lower()..":"..snap(pos.X)..":"..snap(pos.Y)..":"..snap(pos.Z)
+    state.spawnKeyCache[model]=key
+    return key
+end
+
+-- A lightweight respawn gate, indexed by spawn location rather than target
+-- Model alone. RAPID is a "hit-and-move" fallback, NOT proof of a kill.
+-- No GetDescendants() searches are performed here.
+local function quickLife(model)
+    if not model or not model:IsDescendantOf(workspace) then
+        return nil,true,true
+    end
+    local dead=model:GetAttribute("Dead")==true or model:GetAttribute("IsDead")==true
+    local hp=nil
+    for _,field in ipairs({"HealthReal","CurrentHealth","Health","HP"}) do
+        local a=model:GetAttribute(field)
+        if type(a)=="number" then hp=a;break end
+        local v=model:FindFirstChild(field)
+        if v and (v:IsA("NumberValue") or v:IsA("IntValue")) then hp=v.Value;break end
+    end
+    local hum=model:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health<=0 then dead=true end
+    -- Prefer an actual enemy HP label over placeholder Humanoid health.
+    local evidence=state.evidenceCache[model]
+    local label=evidence and evidence.label
+    if label and label.Parent then
+        local barHP=parseHealthText(label.Text)
+        if barHP~=nil then hp=barHP end
+    end
+    if hp==nil and hum then hp=hum.Health end
+    local body=model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+        or model:FindFirstChild("Head")
+    local invisible=(body and body:IsA("BasePart") and body.Transparency>=0.98) or false
+    if label and label.Parent and not label.Visible then invisible=true end
+    return hp,dead,invisible
+end
+
+local function markSpawnTried(model,reason)
+    local key=spawnKey(model)
+    if not key then return end
+    local hp,dead,invisible=quickLife(model)
+    -- Already-blocked same spawn remains blocked; do not extend it forever.
+    local old=state.spawnGates[key]
+    if old and old.model==model then return end
+    state.spawnGates[key]={
+        model=model, at=os.clock(), nextProbe=0, lastHP=hp,
+        sawZero=(hp~=nil and hp<=0) or dead,
+        sawAbsent=invisible or dead, reason=reason or "attack",
+    }
+end
+
+local function spawnReady(model,now)
+    if state.retiredModels[model] then return false end
+    local key=spawnKey(model)
+    if not key then return false end
+    local gate=state.spawnGates[key]
+    if not gate then return true end
+    now=now or os.clock()
+    -- A different alive model at this same spawn is a real respawn candidate.
+    if model~=gate.model then
+        local hp,dead,invisible=quickLife(model)
+        if hp and hp>0 and not dead and not invisible then
+            -- Never pick the old stale Model again after a replacement spawns.
+            state.retiredModels[gate.model]=true
+            state.spawnGates[key]=nil
+            state.spawnCooldown[key]=nil
+            return true
+        end
+        return false
+    end
+    if now<gate.nextProbe then return false end
+    gate.nextProbe=now+RESPAWN_PROBE_INTERVAL
+    local hp,dead,invisible=quickLife(model)
+    if dead or invisible then gate.sawAbsent=true end
+    if (hp~=nil and hp<=0) or dead then gate.sawZero=true end
+    local alive=hp~=nil and hp>0 and not dead and not invisible
+    local reset=alive and (gate.sawAbsent or gate.sawZero)
+    if not reset and alive and gate.lastHP and gate.lastHP>0 then
+        -- Same-model reset after observed damage; not a plain full-HP label.
+        reset=(gate.lastHP < hp*0.65 and now-gate.at>0.5)
+    end
+    -- Important fallback: if the server never exposes death/respawn state,
+    -- don't permanently exclude #1. Recheck after the longer grace period.
+    -- This is NOT an assertion that the monster respawned.
+    if not reset and alive and now-gate.at>=RESPAWN_RETRY_SECONDS then
+        reset=true
+    end
+    if reset then
+        state.spawnGates[key]=nil
+        state.spawnCooldown[key]=nil
+        state.visited[model]=nil
+        return true
+    end
+    return false
 end
 
 -- Discover respawned/streamed-in verified enemies for either farm mode.
@@ -1077,7 +1218,8 @@ local function discoverPrioritySpawns()
                                 existing[old]=nil
                             end
                         end
-                        state.spawnCooldown[key]=nil
+                        -- Do not erase cooldown for a stale same-spawn model.
+                        spawnReady(cur,os.clock())
                     end
                     state.targets[#state.targets+1]=cur
                     state.originalSpawns[cur]=mr.Position
@@ -1088,10 +1230,16 @@ local function discoverPrioritySpawns()
         end
     end
     if added>0 then
+        state.slotsDirty=true
         state.acquireAfter=0
         state.nextPriorityCheck=0
-        refreshList()
-        print("[RE:FINALS V12] World respawn discovery:",added,"new selected enemies")
+        -- Rebuilding 100s of GUI rows on every respawn causes stutter.
+        if (not state.farming or state.priorityOpen)
+            and not state.guiHidden and os.clock()>=state.nextListRefresh then
+            state.nextListRefresh=os.clock()+3
+            refreshList()
+        end
+        print("[RE:FINALS V12.2] New loaded enemy models:",added)
     end
 end
 
@@ -1104,9 +1252,12 @@ local function nearlyDeadFromEnemyHUD(label)
     return hp>0 and hp <= maxHP * FAST_NEXT_HP_PERCENT / 100
 end
 
-local function finishTarget(note, confirmedDead)
+local function finishTarget(note, confirmedDead, retireSpawn)
     if state.active then
-        state.visited[state.active.model] = true
+        if retireSpawn~=false then
+            state.visited[state.active.model] = true
+            markSpawnTried(state.active.model,note)
+        end
         state.lastTarget = state.active.model
         if confirmedDead then
             state.quickRescanPending = true
@@ -1147,44 +1298,26 @@ local function nextTarget()
     if not root or not state.center or state.scanning then return end
     local now=os.clock()
     if now<state.acquireAfter then return end
-    local candidates=buildSlots()
-    local total=#candidates
-    local live={}
-    local bestRank=math.huge
-    for i,m in ipairs(candidates) do
-        local key=spawnKey(m)
-        if now >= (state.spawnCooldown[key or ""] or 0) then
-            local part,_,alive=enemyInfo(m,state.center)
-            if part and alive then
-                local rank=state.modeAll and state.priorityRanks[mobIdentity(m)] or 1
-                if rank then
+    -- Single linear pass: no huge temporary live tables and no resetting
+    -- visited history that could resurrect old stale enemy models.
+    local winner=nil
+    local bestRank,bestDist,bestWasLast=math.huge,math.huge,true
+    for i,m in ipairs(buildSlots()) do
+        local rank=state.modeAll and state.priorityRanks[mobIdentity(m)] or 1
+        if rank and rank<=bestRank then
+            local key=spawnKey(m)
+            if key and now>=(state.spawnCooldown[key] or 0) and spawnReady(m,now) then
+                local part,_,alive=enemyInfo(m,state.center)
+                if part and alive then
                     local d=(part.Position-root.Position).Magnitude
-                    live[#live+1]={model=m,index=i,rank=rank,distance=d}
-                    bestRank=math.min(bestRank,rank)
+                    local wasLast=(m==state.lastTarget)
+                    if not winner or rank<bestRank
+                        or (rank==bestRank and ((bestWasLast and not wasLast)
+                            or (bestWasLast==wasLast and d<bestDist))) then
+                        winner={model=m,index=i}
+                        bestRank,bestDist,bestWasLast=rank,d,wasLast
+                    end
                 end
-            end
-        end
-    end
-    -- Rank is the FIRST filter. A previously visited #1 must ALWAYS outrank
-    -- any unvisited #2/#3. Visited applies only within that highest live rank.
-    local function choose(avoidLast,avoidVisited)
-        local chosen=nil
-        for _,item in ipairs(live) do
-            if item.rank==bestRank
-                and (not avoidLast or item.model~=state.lastTarget)
-                and (not avoidVisited or not state.visited[item.model]) then
-                if not chosen or item.distance<chosen.distance then chosen=item end
-            end
-        end
-        return chosen
-    end
-    local winner=choose(true,true) or choose(false,true)
-    if not winner then
-        winner=choose(true,false) or choose(false,false)
-        if winner then
-            -- New pass only for the current top rank. Do not erase cooldowns.
-            for _,item in ipairs(live) do
-                if item.rank==bestRank then state.visited[item.model]=nil end
             end
         end
     end
@@ -1405,10 +1538,10 @@ end
 
 -- Both NEXT MOB and automatic transitions use EXACTLY this path.
 -- This avoids the old event-only route whose trigger could arrive ~2 seconds late.
-local function advanceSameAsNext(reason, confirmedDead, skipSpawnSeconds)
+local function advanceSameAsNext(reason, confirmedDead, skipSpawnSeconds, retireSpawn)
     local previous = state.active and state.active.model
     local oldKey = previous and spawnKey(previous)
-    if state.active then finishTarget(reason, confirmedDead) end
+    if state.active then finishTarget(reason, confirmedDead, retireSpawn) end
     if skipSpawnSeconds and oldKey then
         state.spawnCooldown[oldKey] = math.max(state.spawnCooldown[oldKey] or 0,
             os.clock() + skipSpawnSeconds)
@@ -1424,26 +1557,33 @@ end
 local function tryPriorityPreempt(target,now)
     if not state.modeAll or #state.priorityOrder==0 or state.transitioning
         or state.active~=target or now<state.nextPriorityCheck then return false end
-    state.nextPriorityCheck=now+0.10
+    state.nextPriorityCheck=now+PRIORITY_PREEMPT_INTERVAL
     local activeRank=state.priorityRanks[mobIdentity(target.model)] or math.huge
     if activeRank<=1 then return false end
-    for _, model in ipairs(state.targets) do
-        local rank=state.priorityRanks[mobIdentity(model)]
-        if rank and rank<activeRank and model~=target.model then
-            local key=spawnKey(model)
-            if now>=(state.spawnCooldown[key or ""] or 0) then
-                local part,_,alive=enemyInfo(model,state.center)
-                if part and alive then
-                    local prior,after=advanceSameAsNext(
-                        "PRIORITY RESPAWN: #"..rank.." "..mobIdentity(model),false)
-                    if after and after~=prior then
-                        print("[RE:FINALS V11] PREEMPT:",
-                            prior and mobIdentity(prior) or "none","->",mobIdentity(after))
-                        return true
+    local topRank=activeRank
+    local found=nil
+    for _,model in ipairs(buildSlots()) do
+        if model~=target.model then
+            local rank=state.priorityRanks[mobIdentity(model)]
+            if rank and rank<topRank then
+                local key=spawnKey(model)
+                if key and now>=(state.spawnCooldown[key] or 0)
+                    and spawnReady(model,now) then
+                    local part,_,alive=enemyInfo(model,state.center)
+                    if part and alive then
+                        found=model
+                        topRank=rank
+                        if topRank==1 then break end
                     end
                 end
             end
         end
+    end
+    if found then
+        -- Preemption is not a kill: do NOT lock the interrupted lower rank.
+        local prior,after=advanceSameAsNext(
+            "PRIORITY READY: #"..topRank.." "..mobIdentity(found),false,nil,false)
+        if after and after~=prior then return true end
     end
     return false
 end
@@ -1456,7 +1596,7 @@ local function hasOtherLivingTarget(current)
     for _, model in ipairs(buildSlots()) do
         if model ~= current and model.Parent then
             local key = spawnKey(model)
-            if now >= (state.spawnCooldown[key or ""] or 0) then
+            if key and now >= (state.spawnCooldown[key] or 0) and spawnReady(model,now) then
                 local mobRoot, _, alive = enemyInfo(model, state.center)
                 if mobRoot and alive then return true end
             end
@@ -1551,7 +1691,7 @@ local function step()
     -- mode the check is most useful while fighting a lower-ranked target.
     if now>=state.nextPriorityDiscovery and
         ((state.modeAll and #state.priorityOrder>0) or (not state.modeAll and state.selected)) then
-        state.nextPriorityDiscovery=now+0.85
+        state.nextPriorityDiscovery=now+DISCOVERY_INTERVAL
         if state.active and state.modeAll then
             local activeRank=state.priorityRanks[mobIdentity(state.active.model)] or math.huge
             if activeRank>1 then discoverPrioritySpawns() end
@@ -1565,13 +1705,12 @@ local function step()
     end
     if not state.active and not state.transitioning then nextTarget() end
     if not state.active then
-        -- If the cached list has no other live monster after a kill, allow
-        -- one prompt area rescan to discover other spawns, not endless scans.
-        if state.quickRescanPending and now-state.lastScan >= 0.55 then
-            state.quickRescanPending = false
-            scanHere(true)
-        elseif now-state.lastScan>=RESCAN_WHEN_EMPTY then
-            scanHere(true) -- slow fallback after the one prompt scan
+        -- No expensive whole-world GetDescendants/GUI rescans while farming.
+        -- DescendantAdded + discoverPrioritySpawns see new loaded models, and
+        -- spawnReady checks existing reused models without teleporting first.
+        if now-state.lastMessageTime>=2.5 then
+            state.lastMessageTime=now
+            info("Waiting for chosen mobs to be ready | F7 = full manual rescan")
         end
         return
     end
@@ -1658,6 +1797,7 @@ addConnection(closeBtn.Activated:Connect(function() state.stop() end))
 addConnection(scanBtn.Activated:Connect(function() scanHere(false) end))
 local function toggleMode()
     state.modeAll = not state.modeAll
+    state.slotsDirty=true
     state.visited = {}; state.rotationIndex = 0; state.acquireAfter = 0; forgetActive()
     modeBtn.Text=state.modeAll and "MODE: PRIORITY ONLY (F5)" or "MODE: SELECTED MOB (F5)"
     if state.modeAll then
@@ -1763,4 +1903,4 @@ task.spawn(function()
         task.wait(state.farming and TICK or 0.7)
     end
 end)
-print("[RE:FINALS V12] WHOLE LOADED MAP + STRICT PRIORITY + RAPID 0.45s | StreamingEnabled:", streamingEnabled(), "| hide:", state.hideKeyName, "| F5 F6 F7 F8")
+print("[RE:FINALS V12.2] SMOOTH PRIORITY, LOW LAG, RESPAWN RECHECK | StreamingEnabled:", streamingEnabled(), "| hide:", state.hideKeyName, "| F5 F6 F7 F8")
